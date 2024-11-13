@@ -1,0 +1,285 @@
+diff --git a/Makefile b/Makefile
+index 62fd0f8..e0993a1 100644
+--- a/Makefile
++++ b/Makefile
+@@ -135,6 +135,7 @@ UPROGS=\
+ 	$U/_rm\
+ 	$U/_sh\
+ 	$U/_stressfs\
++	$U/_testloop\
+ 	$U/_usertests\
+ 	$U/_grind\
+ 	$U/_wc\
+@@ -160,7 +161,7 @@ QEMUGDB = $(shell if $(QEMU) -help | grep -q '^-gdb'; \
+ 	then echo "-gdb tcp::$(GDBPORT)"; \
+ 	else echo "-s -p $(GDBPORT)"; fi)
+ ifndef CPUS
+-CPUS := 3
++CPUS := 1
+ endif
+ 
+ QEMUOPTS = -machine virt -bios none -kernel $K/kernel -m 128M -smp $(CPUS) -nographic
+diff --git a/kernel/param.h b/kernel/param.h
+index 6624bff..8cbc3b0 100644
+--- a/kernel/param.h
++++ b/kernel/param.h
+@@ -11,3 +11,4 @@
+ #define NBUF         (MAXOPBLOCKS*3)  // size of disk block cache
+ #define FSSIZE       2000  // size of file system in blocks
+ #define MAXPATH      128   // maximum file path name
++#define DEFAULT_PRIORITY 1000
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 58a8a0b..461c237 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -146,6 +146,9 @@ found:
+   p->context.ra = (uint64)forkret;
+   p->context.sp = p->kstack + PGSIZE;
+ 
++  p->priority = DEFAULT_PRIORITY;
++  p->waiting_time = 0;
++
+   return p;
+ }
+ 
+@@ -169,6 +172,8 @@ freeproc(struct proc *p)
+   p->killed = 0;
+   p->xstate = 0;
+   p->state = UNUSED;
++
++  p->priority = 0;
+ }
+ 
+ // Create a user page table for a given process, with no user memory,
+@@ -441,6 +446,38 @@ wait(uint64 addr)
+ //  - swtch to start running that process.
+ //  - eventually that process transfers control
+ //    via swtch back to the scheduler.
++// void
++// scheduler(void)
++// {
++//   struct proc *p;
++//   struct cpu *c = mycpu();
++
++//   c->proc = 0;
++//   for(;;){
++//     // The most recent process to run may have had interrupts
++//     // turned off; enable them to avoid a deadlock if all
++//     // processes are waiting.
++//     intr_on();
++
++//     for(p = proc; p < &proc[NPROC]; p++) {
++//       acquire(&p->lock);
++//       if(p->state == RUNNABLE) {
++//         // Switch to chosen process.  It is the process's job
++//         // to release its lock and then reacquire it
++//         // before jumping back to us.
++//         p->state = RUNNING;
++//         c->proc = p;
++//         swtch(&c->context, &p->context);
++
++//         // Process is done running for now.
++//         // It should have changed its p->state before coming back.
++//         c->proc = 0;
++//       }
++//       release(&p->lock);
++//     }
++//   }
++// }
++
+ void
+ scheduler(void)
+ {
+@@ -454,9 +491,44 @@ scheduler(void)
+     // processes are waiting.
+     intr_on();
+ 
++    struct proc *highest_priority_procs[NPROC] = {0};
++    struct proc *highest_priority_proc = 0;
++
++    // find the highest priority process
+     for(p = proc; p < &proc[NPROC]; p++) {
++      acquire(&p->lock);
++      if(p->state == RUNNABLE){
++        if(highest_priority_proc == 0 || p->priority > highest_priority_proc->priority){
++          highest_priority_proc = p;
++        }
++      }
++      release(&p->lock);
++    }
++
++    // no runnable process
++    if(highest_priority_proc == 0){
++      continue;
++    }
++
++    // populate the highest priority processes
++    int i=0;
++    for(p=proc;p<&proc[NPROC];p++){
++      acquire(&p->lock);
++      if(p->state == RUNNABLE && p->priority == highest_priority_proc->priority){
++        highest_priority_procs[i] = p;
++        i++;
++      }
++      release(&p->lock);
++    }
++
++    // roundrobin for the highest priority processes
++    for(i=0;i<NPROC && highest_priority_procs[i] != 0;i++){
++      p = highest_priority_procs[i];
+       acquire(&p->lock);
+       if(p->state == RUNNABLE) {
++        // set waiting time to 0
++        p->waiting_time = 0;
++
+         // Switch to chosen process.  It is the process's job
+         // to release its lock and then reacquire it
+         // before jumping back to us.
+@@ -467,6 +539,22 @@ scheduler(void)
+         // Process is done running for now.
+         // It should have changed its p->state before coming back.
+         c->proc = 0;
++        release(&p->lock);
++        break;
++      }
++      release(&p->lock);
++    }
++
++    // aging mechanism
++    for(p = proc; p < &proc[NPROC]; p++){
++      acquire(&p->lock);
++      if(p->state==RUNNABLE && p->priority != highest_priority_proc->priority){
++        p->waiting_time++;
++        if(p->waiting_time >= 30){
++          p->priority += 10;
++          p->waiting_time = 0;
++          printf("Process %d priority increased to %d\n", p->pid, p->priority);
++        }
+       }
+       release(&p->lock);
+     }
+diff --git a/kernel/proc.h b/kernel/proc.h
+index d021857..12bf96d 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -104,4 +104,7 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++
++  int priority;
++  int waiting_time;
+ };
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index ed65409..2eaf268 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -101,6 +101,8 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_setpriority(void);
++extern uint64 sys_getpriority(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -126,6 +128,8 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_setpriority]   sys_setpriority,
++[SYS_getpriority]   sys_getpriority,
+ };
+ 
+ void
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..164098a 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -20,3 +20,5 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_setpriority  22
++#define SYS_getpriority  23
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 3b4d5bd..3085d8e 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -91,3 +91,19 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++uint64
++sys_setpriority(void)
++{
++  int priority;
++  argint(0, &priority);
++  myproc()->priority = priority;
++  printf("%d set to %d\n", priority, myproc()->pid);
++  return 0;
++}
++
++uint64
++sys_getpriority(void)
++{
++  return myproc()->priority;
++}
+\ No newline at end of file
+diff --git a/user/testloop.c b/user/testloop.c
+new file mode 100644
+index 0000000..3ab555d
+--- /dev/null
++++ b/user/testloop.c
+@@ -0,0 +1,26 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++#define BYEL "\e[1;33m"
++#define BRED "\e[1;31m"
++#define CRESET "\e[0m"
++
++int main(int argc, char* argv[]){
++    int pid = getpid();
++    uint32 iters = atoi(argv[1]);
++    int priority = atoi(argv[2]);
++    setpriority(priority);
++    sleep(5); // to let the scheduler run and set the priority
++    int entry_time = uptime();
++    printf(BYEL "PID %d: Starting %u iterations at time %d. Initial priority: %d, current: %d\n" CRESET, pid, iters, entry_time, priority, getpriority());
++    for(int i = 0; i < iters; i++){
++        // do some dummy work
++        for(int j = 0; j < 50000000; j++){
++            int x = j * j;
++            x = x + 1;
++        }
++    }
++    int exit_time = uptime();
++    printf(BRED "PID %d: Finished at time %d. Initial pr: %d, current: %d\n" CRESET, pid, exit_time, priority, getpriority());
++    exit(0);
++}
+\ No newline at end of file
+diff --git a/user/user.h b/user/user.h
+index 04013ca..26669f5 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -22,6 +22,8 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int setpriority(int);
++int getpriority(void);
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..57fc608 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,5 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("setpriority");
++entry("getpriority");
